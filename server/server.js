@@ -3,7 +3,7 @@ import cors from 'cors';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import {
-  initDb,
+  ensureDbReady,
   getNextOrderNumber,
   incrementOrderNumber,
   getAllOrders,
@@ -98,14 +98,14 @@ app.get('*', (req, res, next) => {
 
 // ─── Start ───────────────────────────────────────────────────────────────────
 
-initDb()
-  .then(() => {
+// Only listen locally, Vercel will call the exported app directly
+if (process.env.NODE_ENV !== 'production' || process.env.LOCAL_SERVER === 'true') {
+  ensureDbReady().then(() => {
     app.listen(PORT, () => {
       console.log(`\n🚀  Aslan Order Flow Server running on http://localhost:${PORT}`);
       console.log(`💾  Database Destination: Neon PostgreSQL Cloud\n`);
     });
-  })
-  .catch(err => {
-    console.error("❌ Failed to connect to Neon PostgreSQL database:", err);
-    process.exit(1);
   });
+}
+
+export default app;
