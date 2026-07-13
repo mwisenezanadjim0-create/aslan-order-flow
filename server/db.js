@@ -1,96 +1,141 @@
-import fs from 'fs';
-import { fileURLToPath } from 'url';
-import { dirname, join } from 'path';
+import pg from 'pg';
+import dotenv from 'dotenv';
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const DB_FILE = process.env.DATABASE_PATH || join(__dirname, 'aslan-orders.json');
+dotenv.config();
 
-// Helper to initialize DB if it doesn't exist
-function initDb() {
-  const dir = dirname(DB_FILE);
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
-  }
-  if (!fs.existsSync(DB_FILE)) {
-    const initialData = {
-      orders: [],
-      reconciliations: [],
-      nextOrderNumber: 1
-    };
-    fs.writeFileSync(DB_FILE, JSON.stringify(initialData, null, 2), 'utf-8');
-  }
-}
+const { Pool } = pg;
 
-// Helper to read DB state atomically
-function readDb() {
-  initDb();
-  try {
-    const content = fs.readFileSync(DB_FILE, 'utf-8');
-    return JSON.parse(content);
-  } catch (err) {
-    console.error("DB read error, returning empty state:", err);
-    return { orders: [], reconciliations: [], nextOrderNumber: 1 };
+// Initialize connection pool
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: {
+    rejectUnauthorized: false
   }
-}
+});
 
-// Helper to write DB state atomically
-function writeDb(data) {
-  try {
-    // Generate temp file first for atomic write (prevent corruption on crash)
-    const tempFile = `${DB_FILE}.tmp`;
-    fs.writeFileSync(tempFile, JSON.stringify(data, null, 2), 'utf-8');
-    fs.renameSync(tempFile, DB_FILE);
-  } catch (err) {
-    console.error("DB write error:", err);
-  }
+// Create tables on Neon if they don't exist
+export async function initDb() {
+  const query = `
+    CREATE TABLE IF NOT EXISTS orders (
+      id VARCHAR(255) PRIMARY KEY,
+      order_number INTEGER NOT NULL,
+      waiter VARCHAR(255) NOT NULL,
+      table_ref VARCHAR(255) NOT NULL,
+      items TEXT NOT NULL,
+      total INTEGER NOT NULL,
+      created_at BIGINT NOT NULL,
+      voided BOOLEAN NOT NULL DEFAULT false,
+      void_reason TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS reconciliations (
+      id VARCHAR(255) PRIMARY KEY,
+      created_at BIGINT NOT NULL,
+      tickets_counted INTEGER NOT NULL,
+      plates_out INTEGER NOT NULL,
+      system_tickets INTEGER NOT NULL,
+      gap INTEGER NOT NULL,
+      note TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS settings (
+      key VARCHAR(255) PRIMARY KEY,
+      value VARCHAR(255) NOT NULL
+    );
+
+    INSERT INTO settings (key, value) 
+    VALUES ('nextOrderNumber', '1') 
+    ON CONFLICT (key) DO NOTHING;
+  `;
+  await pool.query(query);
+  console.log("✅ Neon PostgreSQL schema verified and active.");
 }
 
 // ─── Query Helpers ────────────────────────────────────────────────────────────
 
-export function getNextOrderNumber() {
-  const db = readDb();
-  return db.nextOrderNumber || 1;
+export async function getNextOrderNumber() {
+  const res = await pool.query(`SELECT value FROM settings WHERE key = $1`, ['nextOrderNumber']);
+  if (res.rows.length === 0) return 1;
+  return parseInt(res.rows[0].value, 10);
 }
 
-export function incrementOrderNumber() {
-  const db = readDb();
-  db.nextOrderNumber = (db.nextOrderNumber || 1) + 1;
-  writeDb(db);
+export async function incrementOrderNumber() {
+  await pool.query(`
+    UPDATE settings 
+    SET value = CAST(CAST(value AS INTEGER) + 1 AS VARCHAR) 
+    WHERE key = $1
+  `, ['nextOrderNumber']);
 }
 
-export function getAllOrders() {
-  const db = readDb();
-  return db.orders || [];
+export async function getAllOrders() {
+  const res = await pool.query(`SELECT * FROM orders ORDER BY order_number ASC`);
+  return res.rows.map(o => ({
+    id: o.id,
+    orderNumber: o.order_number,
+    waiter: o.waiter,
+    table: o.table_ref,
+    tableRef: o.table_ref,
+    items: JSON.parse(o.items),
+    total: o.total,
+    createdAt: parseInt(o.created_at, 10),
+    voided: o.voided,
+    voidReason: o.void_reason
+  }));
 }
 
-export function insertOrder(order) {
-  const db = readDb();
-  db.orders.push({
-    ...order,
-    voided: false,
-    voidReason: null
-  });
-  writeDb(db);
+export async function insertOrder(order) {
+  const query = `
+    INSERT INTO orders (id, order_number, waiter, table_ref, items, total, created_at, voided, void_reason)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+  `;
+  await pool.query(query, [
+    order.id,
+    order.orderNumber,
+    order.waiter,
+    order.table || order.tableRef,
+    JSON.stringify(order.items),
+    order.total,
+    order.createdAt,
+    order.voided || false,
+    order.voidReason || null
+  ]);
 }
 
-export function voidOrder(id, reason) {
-  const db = readDb();
-  db.orders = db.orders.map(o => o.id === id ? { ...o, voided: true, voidReason: reason } : o);
-  writeDb(db);
+export async function voidOrder(id, reason) {
+  await pool.query(`UPDATE orders SET voided = true, void_reason = $1 WHERE id = $2`, [reason, id]);
 }
 
-export function getAllReconciliations() {
-  const db = readDb();
-  return db.reconciliations || [];
+export async function getAllReconciliations() {
+  const res = await pool.query(`SELECT * FROM reconciliations ORDER BY created_at ASC`);
+  return res.rows.map(r => ({
+    id: r.id,
+    createdAt: parseInt(r.created_at, 10),
+    ticketsCounted: r.tickets_counted,
+    platesOut: r.plates_out,
+    systemTickets: r.system_tickets,
+    gap: r.gap,
+    note: r.note
+  }));
 }
 
-export function insertReconciliation(entry) {
-  const db = readDb();
-  db.reconciliations.push(entry);
-  writeDb(db);
+export async function insertReconciliation(entry) {
+  const query = `
+    INSERT INTO reconciliations (id, created_at, tickets_counted, plates_out, system_tickets, gap, note)
+    VALUES ($1, $2, $3, $4, $5, $6, $7)
+  `;
+  await pool.query(query, [
+    entry.id,
+    entry.createdAt,
+    entry.ticketsCounted,
+    entry.platesOut,
+    entry.systemTickets,
+    entry.gap,
+    entry.note
+  ]);
 }
 
 export default {
+  initDb,
   getNextOrderNumber,
   incrementOrderNumber,
   getAllOrders,
